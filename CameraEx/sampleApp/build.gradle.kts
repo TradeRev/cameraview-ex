@@ -16,6 +16,7 @@ plugins {
     id("com.android.application")
     kotlin("android")
     kotlin("android.extensions")
+    id("com.google.gms.google-services")
 }
 
 android {
@@ -62,7 +63,7 @@ android {
             signingConfig = signingConfigs["release"]
         }
 
-        create("stage").apply {
+        create("stage") {
             initWith(buildTypes["release"])
             applicationIdSuffix = ".stage"
             versionNameSuffix = "-stage"
@@ -80,19 +81,55 @@ dependencies {
 
     implementation(fileTree(mapOf("include" to arrayOf("*.jar"), "dir" to "libs")))
 
-    // cameraviewex
-    implementation(project(":cameraViewEx"))
+    // CameraViewEx
+//    implementation("com.priyankvasa.android:cameraview-ex:3.4.2")
+    implementation("com.priyankvasa.android:cameraview-ex:3.4.2-debug")
 
     // Kotlin
     implementation(Config.Libs.kotlinStdLibJdk8)
 
+    // Coroutines
+    implementation(Config.Libs.coroutinesCore)
+    implementation(Config.Libs.coroutinesAndroid)
+
     // Android support
     implementation(Config.Libs.appcompatV7)
     implementation(Config.Libs.constraintLayout)
+
+    // Firebase
+    implementation(Config.Libs.firebaseCore)
+    implementation(Config.Libs.firebaseMlVision)
 
     // Glide
     implementation(Config.Libs.glide) { exclude("com.android.support") }
 
     // Timber
     implementation(Config.Libs.timber)
+}
+
+afterEvaluate {
+
+    tasks.create("buildCameraViewEx")
+
+    // For each build type, create a buildCameraViewEx task and
+    // make all assemble tasks dependent on respective buildCameraViewEx task
+    val buildTypes = arrayOf("Debug", "Stage", "Release")
+
+    buildTypes.forEach { buildType ->
+
+        val buildCameraViewExTask = "buildCameraViewEx$buildType"
+
+        tasks.create<Exec>(buildCameraViewExTask) {
+            workingDir("$rootDir/../")
+            // Assemble and publish (locally) cameraViewEx module
+            commandLine(
+                "sh",
+                "-c",
+                "./gradlew :cameraViewEx:assemble$buildType :cameraViewEx:publish${buildType}PublicationToMavenRepository"
+            )
+        }
+
+        tasks["assemble$buildType"].dependsOn(tasks[buildCameraViewExTask])
+        tasks["buildCameraViewEx"].dependsOn(tasks[buildCameraViewExTask])
+    }
 }
