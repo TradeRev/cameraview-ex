@@ -42,7 +42,7 @@ class AspectRatio private constructor(val x: Int, val y: Int) : Comparable<Aspec
     fun toFloat(): Float = x.toFloat() / y
 
     override fun hashCode(): Int =
-    // assuming most sizes are <2^16, doing a rotate will give us perfect hashing
+        // assuming most sizes are <2^16, doing a rotate will give us perfect hashing
         y xor (x shl Integer.SIZE / 2 or x.ushr(Integer.SIZE / 2))
 
     override fun compareTo(other: AspectRatio): Int = when {
@@ -54,9 +54,11 @@ class AspectRatio private constructor(val x: Int, val y: Int) : Comparable<Aspec
     /**
      * @return The inverse of this [AspectRatio].
      */
-    fun inverse(): AspectRatio = AspectRatio.of(y, x)
+    fun inverse(): AspectRatio = of(y, x)
 
     companion object {
+
+        val Invalid: AspectRatio = AspectRatio(0, 0)
 
         private val cache = SparseArrayCompat<SparseArrayCompat<AspectRatio>>(16)
 
@@ -70,17 +72,16 @@ class AspectRatio private constructor(val x: Int, val y: Int) : Comparable<Aspec
          */
         @JvmStatic
         fun of(x: Int, y: Int): AspectRatio {
-            var a = x
-            var b = y
-            val gcd = gcd(a, b)
+            var a: Int = x
+            var b: Int = y
+            val gcd: Int = gcd(a, b)
             a /= gcd
             b /= gcd
 
             return cache.get(a)
                 ?.run { get(b) ?: AspectRatio(a, b).also { put(b, it) } }
-                ?: AspectRatio(a, b).also {
-                    cache.put(a, SparseArrayCompat<AspectRatio>().apply { put(b, it) })
-                }
+                ?: AspectRatio(a, b)
+                    .also { cache.put(a, SparseArrayCompat<AspectRatio>().apply { put(b, it) }) }
         }
 
         /**
@@ -103,7 +104,7 @@ class AspectRatio private constructor(val x: Int, val y: Int) : Comparable<Aspec
         @JvmSynthetic
         @Throws(IllegalArgumentException::class)
         internal fun parse(s: String): AspectRatio = try {
-            s.split(':').let { AspectRatio.of(it[0].trim().toInt(), it[1].trim().toInt()) }
+            s.split(':').let { of(it[0].trim().toInt(), it[1].trim().toInt()) }
         } catch (e: NumberFormatException) {
             throw IllegalArgumentException("Malformed aspect ratio: $s", e)
         }
@@ -122,7 +123,7 @@ class AspectRatio private constructor(val x: Int, val y: Int) : Comparable<Aspec
         @JvmField
         val CREATOR: Parcelable.Creator<AspectRatio> = object : Parcelable.Creator<AspectRatio> {
             override fun createFromParcel(parcel: Parcel): AspectRatio =
-                AspectRatio.of(parcel.readInt(), parcel.readInt())
+                of(parcel.readInt(), parcel.readInt())
 
             override fun newArray(size: Int): Array<AspectRatio?> = arrayOfNulls(size)
         }

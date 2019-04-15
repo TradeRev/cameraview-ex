@@ -19,8 +19,8 @@ object Config {
     const val jvmTarget = "1.8"
 
     private const val majorVersion = 3
-    private const val minorVersion = 2
-    private const val patchVersion = 0
+    private const val minorVersion = 4
+    private const val patchVersion = 3
     private const val versionClassifier = ""
 
     val versionName: String
@@ -33,7 +33,7 @@ object Config {
             patchVersion
 
     object Versions {
-        const val kotlin = "1.3.11"
+        const val kotlin = "1.3.30"
         const val support = "28.0.0"
         const val constraintLayout = "1.1.3"
         const val dokka = "0.9.17"
