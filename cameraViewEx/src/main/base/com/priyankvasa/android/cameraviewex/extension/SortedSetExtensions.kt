@@ -20,22 +20,26 @@ import com.priyankvasa.android.cameraviewex.Size
 import java.util.SortedSet
 
 /**
- * Chooses the optimal size based on respective supported sizes
- * and the surface size of [viewWidth] and [viewHeight].
+ * Chooses the optimal size based on [previewWidth] and [previewHeight].
+ *
+ * Find the longer and shorter edge from preview dimensions.
+ * Choose smallest of sizes which has width >= longerEdge `AND` height >= shorterEdge.
+ * Best case would be a size with exact dimensions as [previewWidth] and [previewHeight].
+ * If none found then choose largest of sizes whose width < longerEdge `OR` height < shorterEdge.
+ *
+ * If set is empty return [Size.Invalid].
  *
  * @return The picked optimal size.
  */
-internal fun SortedSet<Size>.chooseOptimalPreviewSize(viewWidth: Int, viewHeight: Int): Size {
+internal fun SortedSet<Size>.chooseOptimalPreviewSize(previewWidth: Int, previewHeight: Int): Size {
 
-    val (maxWidth: Int, maxHeight: Int) =
-        if (viewHeight > viewWidth) viewHeight to viewWidth
-        else viewWidth to viewHeight
+    if (isEmpty()) return Size.Invalid
 
-    return asSequence()
-        .filter { it.width <= maxWidth && it.height <= maxHeight }
-        .run {
-            firstOrNull { it.width >= viewWidth && it.height >= viewHeight }
-                ?: lastOrNull { it.width < viewWidth || it.height < viewHeight }
-                ?: last()
-        }
+    val (surfaceLonger: Int, surfaceShorter: Int) =
+        if (previewWidth > previewHeight) previewWidth to previewHeight
+        else previewHeight to previewWidth
+
+    return firstOrNull { it.width >= surfaceLonger && it.height >= surfaceShorter }
+        ?: lastOrNull { it.width < previewWidth || it.height < previewHeight }
+        ?: last()
 }

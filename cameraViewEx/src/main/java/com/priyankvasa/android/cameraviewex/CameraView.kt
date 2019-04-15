@@ -35,8 +35,12 @@ import com.priyankvasa.android.cameraviewex.extension.getValue
 import com.priyankvasa.android.cameraviewex.extension.isUiThread
 import com.priyankvasa.android.cameraviewex.extension.setValue
 import kotlinx.android.parcel.Parcelize
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import org.koin.android.BuildConfig
 import timber.log.Timber
 import java.io.File
 
@@ -47,42 +51,24 @@ class CameraView @JvmOverloads constructor(
 ) : FrameLayout(context, attrs, defStyleAttr) {
 
     init {
-        if (BuildConfig.DEBUG) {
+        if (!isInEditMode && BuildConfig.DEBUG) {
             Timber.forest().find { it is Timber.DebugTree } ?: Timber.plant(Timber.DebugTree())
             System.setProperty("kotlinx.coroutines.debug", "on")
         }
     }
 
-    private val parentJob: Job = SupervisorJob()
+    private val parentJob: Job by lazy { SupervisorJob() }
 
-    private val preview: PreviewImpl = createPreview(context)
+    private val coroutineScope: CoroutineScope by lazy { CoroutineScope(parentJob + Dispatchers.Main) }
 
-    private val listenerManager: CameraListenerManager = CameraListenerManager(SupervisorJob(parentJob))
-        .apply { cameraOpenedListeners.add { requestLayout() } }
-
-    /** Display orientation detector */
-    private val orientationDetector: OrientationDetector = object : OrientationDetector(context) {
-
-        override fun onDisplayOrientationChanged(displayOrientation: Int) {
-            preview.setDisplayOrientation(displayOrientation)
-            camera.deviceRotation = displayOrientation
-        }
-
-        override fun onSensorOrientationChanged(sensorOrientation: Int) {
-            val orientation: Orientation = Orientation.parse(sensorOrientation)
-            val rotation: Int = when (orientation) {
-                Orientation.Portrait, Orientation.PortraitInverted -> orientation.value
-                Orientation.Landscape -> Orientation.LandscapeInverted.value
-                Orientation.LandscapeInverted -> Orientation.Landscape.value
-                Orientation.Unknown -> return
-            }
-            if (camera.deviceRotation != rotation) camera.deviceRotation = rotation
-        }
+    private val listenerManager: CameraListenerManager by lazy {
+        CameraListenerManager(SupervisorJob(parentJob))
+            .apply { cameraOpenedListeners.add { requestLayout() } }
+            .also { if (isInEditMode) it.disable() }
     }
 
     private val config: CameraConfiguration =
-        if (checkInEditMode()) CameraConfiguration.defaultConfig
-        else CameraConfiguration.newInstance(
+        CameraConfiguration.newInstance(
             context,
             attrs,
             defStyleAttr,
@@ -92,25 +78,57 @@ class CameraView @JvmOverloads constructor(
             }
         )
 
-    private var camera: CameraInterface = run {
+    private val preview: PreviewImpl by lazy {
+        createPreview(context)
+            .also {
+                // Add shutter view to CameraView
+                addView(it.shutterView)
+            }
+    }
 
-        val cameraJob: Job = SupervisorJob(parentJob)
+    /** Display orientation detector */
+    private val orientationDetector: OrientationDetector by lazy {
 
-        // Based on OS version select the best camera implementation
-        return@run when {
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP ->
-                Camera1(listenerManager, preview, config, cameraJob)
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.M ->
-                Camera2(listenerManager, preview, config, cameraJob, context)
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.N ->
-                Camera2Api23(listenerManager, preview, config, cameraJob, context)
-            else -> Camera2Api24(listenerManager, preview, config, cameraJob, context)
+        object : OrientationDetector(context) {
+
+            override fun onDisplayOrientationChanged(displayOrientation: Int) {
+                preview.setDisplayOrientation(displayOrientation)
+                camera.deviceRotation = displayOrientation
+                camera.screenRotation = displayOrientation
+            }
+
+            override fun onSensorOrientationChanged(sensorOrientation: Int) {
+                val rotation: Int = when (val orientation: Orientation = Orientation.parse(sensorOrientation)) {
+                    Orientation.Portrait, Orientation.PortraitInverted -> orientation.value
+                    Orientation.Landscape -> Orientation.LandscapeInverted.value
+                    Orientation.LandscapeInverted -> Orientation.Landscape.value
+                    Orientation.Unknown -> return
+                }
+                if (camera.deviceRotation != rotation) camera.deviceRotation = rotation
+            }
         }
     }
 
+    private var camera: CameraInterface =
+        // Based on OS version select the best camera implementation
+        when {
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP ->
+                Camera1(listenerManager, preview, config, SupervisorJob(parentJob))
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.M ->
+                Camera2(listenerManager, preview, config, SupervisorJob(parentJob), context)
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.N ->
+                Camera2Api23(listenerManager, preview, config, SupervisorJob(parentJob), context)
+            else -> Camera2Api24(listenerManager, preview, config, SupervisorJob(parentJob), context)
+        }
+
     init {
-        config.aspectRatio.observe(camera) { if (camera.setAspectRatio(it)) requestLayout() }
-        config.shutter.observe(camera) { preview.shutterView.shutterTime = it }
+        if (!isInEditMode) {
+            config.aspectRatio.observe(camera) {
+                camera.setAspectRatio(it)
+                coroutineScope.launch { requestLayout() }
+            }
+            config.shutter.observe(camera) { preview.shutterView.shutterTime = it }
+        }
     }
 
     internal val isUiTestCompatible: Boolean get() = camera is Camera2
@@ -149,7 +167,20 @@ class CameraView @JvmOverloads constructor(
         }
 
     /** Current aspect ratio of camera. Valid format is "height:width" eg. "4:3". */
-    var aspectRatio: AspectRatio by config.aspectRatio::value
+    var aspectRatio: AspectRatio
+        get() = config.aspectRatio.value
+        set(ratio) {
+            // Check if new aspect ratio is supported
+            if (!supportedAspectRatios.contains(ratio)) {
+                listenerManager.onCameraError(
+                    CameraViewException("Aspect ratio $this is not supported by this device." +
+                        " Valid ratios are CameraView.supportedAspectRatios $supportedAspectRatios."),
+                    ErrorLevel.ErrorCritical
+                )
+                return
+            }
+            config.aspectRatio.value = ratio
+        }
 
     /**
      * Set format of the output of image data produced from the camera for [Modes.CameraMode.SINGLE_CAPTURE] mode.
@@ -288,40 +319,38 @@ class CameraView @JvmOverloads constructor(
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        if (isInEditMode) {
+
+        if (!isInEditMode && !isCameraOpened) {
             super.onMeasure(widthMeasureSpec, heightMeasureSpec)
             return
         }
+
         // Handle android:adjustViewBounds
         if (adjustViewBounds) {
 
-            if (!isCameraOpened) {
-                listenerManager.reserveRequestLayoutOnOpen()
-                super.onMeasure(widthMeasureSpec, heightMeasureSpec)
-                return
-            }
+            val widthMode: Int = MeasureSpec.getMode(widthMeasureSpec)
+            val heightMode: Int = MeasureSpec.getMode(heightMeasureSpec)
 
-            val widthMode: Int = View.MeasureSpec.getMode(widthMeasureSpec)
-            val heightMode: Int = View.MeasureSpec.getMode(heightMeasureSpec)
-
-            if (widthMode == View.MeasureSpec.EXACTLY && heightMode != View.MeasureSpec.EXACTLY) {
-                val ratio: AspectRatio = config.aspectRatio.value
-                var height: Int = (View.MeasureSpec.getSize(widthMeasureSpec) * ratio.toFloat()).toInt()
-                if (heightMode == View.MeasureSpec.AT_MOST) {
-                    height = Math.min(height, View.MeasureSpec.getSize(heightMeasureSpec))
+            if (widthMode == MeasureSpec.EXACTLY && heightMode != MeasureSpec.EXACTLY) {
+                val ratio: AspectRatio = config.aspectRatio.value.inverse()
+                var height: Int = (MeasureSpec.getSize(widthMeasureSpec) * ratio.toFloat()).toInt()
+                if (heightMode == MeasureSpec.AT_MOST) {
+                    height = Math.min(height, MeasureSpec.getSize(heightMeasureSpec))
                 }
                 super.onMeasure(
                     widthMeasureSpec,
-                    View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+                    MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY)
                 )
-            } else if (widthMode != View.MeasureSpec.EXACTLY && heightMode == View.MeasureSpec.EXACTLY) {
+            } else if (widthMode != MeasureSpec.EXACTLY && heightMode == MeasureSpec.EXACTLY) {
                 val ratio: AspectRatio = config.aspectRatio.value
-                var width: Int = (View.MeasureSpec.getSize(heightMeasureSpec) * ratio.toFloat()).toInt()
-                if (widthMode == View.MeasureSpec.AT_MOST) {
-                    width = Math.min(width, View.MeasureSpec.getSize(widthMeasureSpec))
+                var width: Int = (MeasureSpec.getSize(heightMeasureSpec) * ratio.toFloat()).toInt()
+                if (widthMode == MeasureSpec.AT_MOST) {
+                    width = Math.min(width, MeasureSpec.getSize(widthMeasureSpec))
                 }
-                super.onMeasure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-                    heightMeasureSpec)
+                super.onMeasure(
+                    MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+                    heightMeasureSpec
+                )
             } else {
                 super.onMeasure(widthMeasureSpec, heightMeasureSpec)
             }
@@ -329,31 +358,16 @@ class CameraView @JvmOverloads constructor(
             super.onMeasure(widthMeasureSpec, heightMeasureSpec)
         }
 
-        // Measure the TextureView
-        val width: Int = measuredWidth
-        val height: Int = measuredHeight
-        var ratio: AspectRatio = config.aspectRatio.value
+        if (isInEditMode) return // Don't measure texture view and shutter view in edit mode
 
-        if (orientationDetector.lastKnownDisplayOrientation % 180 == 0) ratio = ratio.inverse()
+        val wMeasureSpec: Int = MeasureSpec.makeMeasureSpec(measuredWidth, MeasureSpec.EXACTLY)
+        val hMeasureSpec: Int = MeasureSpec.makeMeasureSpec(measuredHeight, MeasureSpec.EXACTLY)
 
-        if (height < width * ratio.y / ratio.x) preview.view.measure(
-            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(
-                width * ratio.y / ratio.x,
-                View.MeasureSpec.EXACTLY
-            )
-        ) else preview.view.measure(
-            View.MeasureSpec.makeMeasureSpec(
-                height * ratio.x / ratio.y,
-                View.MeasureSpec.EXACTLY
-            ),
-            View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
-        )
-
-        preview.shutterView.layoutParams = preview.view.layoutParams
+        // Measure texture view and shutter view
+        preview.measure(wMeasureSpec, hMeasureSpec)
     }
 
-    override fun onSaveInstanceState(): Parcelable? =
+    override fun onSaveInstanceState(): Parcelable =
         SavedState(
             super.onSaveInstanceState() ?: Bundle(),
             adjustViewBounds,
@@ -401,26 +415,6 @@ class CameraView @JvmOverloads constructor(
         }
     }
 
-    /**
-     * Set camera mode of operation. Supported values are [Modes.CameraMode].
-     * Valid format is "height:width" eg. "4:3".
-     */
-    fun setCameraMode(@Modes.CameraMode mode: Int) {
-        if (!requireInUiThread()) return
-        config.cameraMode.value = mode
-    }
-
-    private fun checkInEditMode(): Boolean = if (isInEditMode) {
-        listenerManager.disable()
-        orientationDetector.disable()
-        true
-    } else {
-        // Add shutter view
-        addView(preview.shutterView)
-        preview.shutterView.layoutParams = preview.view.layoutParams
-        false
-    }
-
     private fun createPreview(context: Context): PreviewImpl = TextureViewPreview(context, this)
 
     private fun requireActive(): Boolean = isActive.also {
@@ -435,6 +429,50 @@ class CameraView @JvmOverloads constructor(
             CameraViewException("Camera is not open. Call start() first."),
             errorLevel = ErrorLevel.Warning
         )
+    }
+
+    /** Set camera mode of operation. Supported values are [Modes.CameraMode]. */
+    fun setCameraMode(@Modes.CameraMode mode: Int) {
+        if (!requireInUiThread()) return
+        config.cameraMode.value = mode
+    }
+
+    /**
+     * Enable any single camera mode or multiple camera modes by passing [Modes.CameraMode].
+     * Multiple modes can be enabled by passing bitwise or'ed value of multiple [Modes.CameraMode].
+     * @sample enableCameraMode(Modes.CameraMode.SINGLE_CAPTURE or Modes.CameraMode.VIDEO_CAPTURE)
+     */
+    fun enableCameraMode(@Modes.CameraMode mode: Int) {
+        if (!requireInUiThread()) return
+        config.cameraMode.value = config.cameraMode.value or mode
+    }
+
+    /** Disable any camera mode from [Modes.CameraMode], one at a time */
+    fun disableCameraMode(@Modes.CameraMode mode: Int) {
+        if (!requireInUiThread()) return
+        var newMode = 0
+        when (mode) {
+            Modes.CameraMode.CONTINUOUS_FRAME -> {
+                if (isSingleCaptureModeEnabled) newMode = newMode or Modes.CameraMode.SINGLE_CAPTURE
+                if (isVideoCaptureModeEnabled) newMode = newMode or Modes.CameraMode.VIDEO_CAPTURE
+            }
+            Modes.CameraMode.SINGLE_CAPTURE -> {
+                if (isContinuousFrameModeEnabled) newMode = newMode or Modes.CameraMode.CONTINUOUS_FRAME
+                if (isVideoCaptureModeEnabled) newMode = newMode or Modes.CameraMode.VIDEO_CAPTURE
+            }
+            Modes.CameraMode.VIDEO_CAPTURE -> {
+                if (isContinuousFrameModeEnabled) newMode = newMode or Modes.CameraMode.CONTINUOUS_FRAME
+                if (isSingleCaptureModeEnabled) newMode = newMode or Modes.CameraMode.SINGLE_CAPTURE
+            }
+            else -> {
+                listenerManager.onCameraError(
+                    CameraViewException("Invalid camera mode $mode"),
+                    ErrorLevel.Warning
+                )
+                return
+            }
+        }
+        config.cameraMode.value = newMode
     }
 
     /**
@@ -456,7 +494,7 @@ class CameraView @JvmOverloads constructor(
         }
 
         // Save original state and restore later if camera falls back to using Camera1
-        val state: Parcelable? = onSaveInstanceState()
+        val state: Parcelable = onSaveInstanceState()
 
         if (camera.start()) return // Camera started successfully, return.
 
@@ -468,10 +506,15 @@ class CameraView @JvmOverloads constructor(
         if (camera is Camera1) return
 
         // Device uses legacy hardware layer; fall back to Camera1
+        fallback(state)
+    }
+
+    private fun fallback(savedState: Parcelable) {
+
         camera = Camera1(listenerManager, preview, config, SupervisorJob(parentJob))
 
         // Restore original state
-        onRestoreInstanceState(state)
+        onRestoreInstanceState(savedState)
 
         // Try to start camera again using Camera1 api
         // Return if successful
@@ -607,14 +650,23 @@ class CameraView @JvmOverloads constructor(
      *
      * @param listener lambda with image of type [Image] as its argument
      * which contains the preview frame from camera and its metadata in form of [android.support.media.ExifInterface].
+     * @param maxFrameRate is maximum number of frames per second.
+     *   Actual frame rate might be less based on device capabilities but will not be more than this value.
+     *   A float can be set for eg., max frame rate of 0.5f will produce one frame every 2 seconds.
+     *   Any value less than or equal to zero (<= 0f) will produce maximum frames per second supported by device.
+     *   Not providing this value uses the maximum possible frame rate.
      *
      * @return instance of [CameraView] it is called on
      *
      * @sample com.priyankvasa.android.cameraviewex_sample.camera.CameraPreviewFrameHandler.listener
      */
+    @JvmOverloads
     @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
-    fun setPreviewFrameListener(listener: (image: Image) -> Unit): CameraView {
-        if (listenerManager.isEnabled) listenerManager.previewFrameListener = listener
+    fun setPreviewFrameListener(maxFrameRate: Float = 0f, listener: (image: Image) -> Unit): CameraView {
+        if (listenerManager.isEnabled) {
+            camera.maxPreviewFrameRate = maxFrameRate
+            listenerManager.previewFrameListener = listener
+        }
         return this
     }
 

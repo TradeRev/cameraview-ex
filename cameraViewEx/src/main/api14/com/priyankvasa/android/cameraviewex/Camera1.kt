@@ -24,9 +24,10 @@ import android.arch.lifecycle.Lifecycle
 import android.arch.lifecycle.LifecycleRegistry
 import android.graphics.ImageFormat
 import android.hardware.Camera
-import android.support.media.ExifInterface
+import android.os.SystemClock
 import android.support.v4.util.SparseArrayCompat
 import android.view.SurfaceHolder
+import com.priyankvasa.android.cameraviewex.exif.ExifInterface
 import com.priyankvasa.android.cameraviewex.extension.chooseOptimalPreviewSize
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
@@ -35,10 +36,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.IOException
-import java.util.SortedSet
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.CoroutineContext
+import kotlin.math.roundToInt
 
 internal class Camera1(
     private val listener: CameraInterface.Listener,
@@ -68,21 +70,46 @@ internal class Camera1(
     private val videoManager: VideoManager
         by lazy { VideoManager { listener.onCameraError(CameraViewException(it), ErrorLevel.Warning) } }
 
+    private var debounceIntervalMillis: Int = -1
+
+    override var maxPreviewFrameRate: Float = -1f
+        set(value) {
+            field = value
+            debounceIntervalMillis = when {
+                value <= 0 -> -1
+                value < 1 -> ((1 / value) * 1000).roundToInt()
+                else -> (1000 / value).roundToInt()
+            }
+        }
+
     private val previewCallback: Camera.PreviewCallback by lazy {
+
+        // Timestamp of the last frame processed. Used for de-bouncing purposes.
+        val lastTimeStamp = AtomicLong(0L)
+
         Camera.PreviewCallback { data: ByteArray?, camera: Camera? ->
+
+            // Data may be null when Camera api is "catching breath" between frame generation
             if (camera == null || data == null) return@PreviewCallback
-            val exceptionHandler = CoroutineExceptionHandler { _, _ -> }
-            launch(exceptionHandler) {
-                camera.runCatching {
-                    val image = Image(
-                        data,
-                        parameters.previewSize.width,
-                        parameters.previewSize.height,
-                        ExifInterface(data.inputStream()),
-                        parameters.previewFormat
-                    )
-                    listener.onPreviewFrame(image)
-                }
+
+            // Use debounce logic only if interval is > 0. If not, it means user wants max frame rate
+            if (debounceIntervalMillis > 0) {
+                val currentTimeStamp: Long = SystemClock.elapsedRealtime()
+                // Debounce if current timestamp is within debounce interval
+                if (debounceIntervalMillis > currentTimeStamp - lastTimeStamp.get()) return@PreviewCallback
+                // Otherwise update last frame timestamp to current
+                else lastTimeStamp.set(currentTimeStamp)
+            }
+
+            launch(CoroutineExceptionHandler { _, _ -> }) {
+                val image = Image(
+                    data,
+                    camera.parameters.previewSize.width,
+                    camera.parameters.previewSize.height,
+                    ExifInterface().apply { rotation = calcCameraRotation(deviceRotation) },
+                    camera.parameters.previewFormat
+                )
+                listener.onPreviewFrame(image)
             }
         }
     }
@@ -98,7 +125,10 @@ internal class Camera1(
                     data,
                     parameters.pictureSize.width,
                     parameters.pictureSize.height,
-                    ExifInterface(data.inputStream()),
+                    ExifInterface().apply {
+                        if (parameters.pictureFormat == ImageFormat.JPEG && readExifSafe(data)) return@apply
+                        rotation = calcCameraRotation(deviceRotation)
+                    },
                     parameters.pictureFormat
                 )
                 listener.onPictureTaken(image)
@@ -119,6 +149,8 @@ internal class Camera1(
             field = value
             if (isCameraOpened) updateCameraParams { setRotation(calcCameraRotation(value)) }
         }
+
+    override var screenRotation: Int = 0
 
     override val isActive: Boolean get() = cameraJob.isActive
 
@@ -287,16 +319,8 @@ internal class Camera1(
             return@getOrElse false
         }
 
-    override fun setAspectRatio(ratio: AspectRatio): Boolean {
-        // Handle this later when camera is opened
-        if (!isCameraOpened) return true
-        val sizes: SortedSet<Size> = previewSizes.sizes(ratio)
-        if (sizes.isEmpty()) {
-            listener.onCameraError(CameraViewException("Ratio $ratio is not supported"))
-            return false
-        }
+    override fun setAspectRatio(ratio: AspectRatio) {
         adjustCameraParameters()
-        return true
     }
 
     override fun takePicture() {
@@ -405,58 +429,46 @@ internal class Camera1(
         // It is recommended to open camera on another thread
         // https://developer.android.com/training/camera/cameradirect.html#TaskOpenCamera
         camera = runBlocking(coroutineContext) { Camera.open(cameraId) }.apply {
+
             // Supported preview sizes
             previewSizes.clear()
             parameters.supportedPreviewSizes
                 ?.forEach { previewSizes.add(it.width, it.height) }
-            // Supported picture sizes;
-            pictureSizes.clear()
-            parameters.supportedPictureSizes
-                ?.forEach { pictureSizes.add(it.width, it.height) }
-            // Supported video sizes;
+
+            // Supported video sizes
             parameters.supportedVideoSizes
                 ?.asSequence()
                 ?.map { com.priyankvasa.android.cameraviewex.Size(it.width, it.height) }
                 ?.let { videoManager.addVideoSizes(it) }
+
+            // Supported picture sizes
+            pictureSizes.clear()
+            parameters.supportedPictureSizes
+                ?.forEach { pictureSizes.add(it.width, it.height) }
+
             setDisplayOrientation(calcDisplayOrientation(deviceRotation))
         }
         adjustCameraParameters()
         listener.onCameraOpened()
     }
 
-    private fun chooseAspectRatio(): AspectRatio {
-        var r: AspectRatio = Modes.DEFAULT_ASPECT_RATIO
-        previewSizes.ratios().forEach { ratio: AspectRatio ->
-            r = ratio
-            if (ratio == Modes.DEFAULT_ASPECT_RATIO) return ratio
-        }
-        return r
-    }
-
     private fun adjustCameraParameters() {
 
         if (!preview.isReady) return
 
-        val sizes: SortedSet<Size> = previewSizes.sizes(config.aspectRatio.value)
+        val previewSize: Size =
+            previewSizes.sizes(config.sensorAspectRatio)
+                .chooseOptimalPreviewSize(preview.width, preview.height)
 
-        if (sizes.isEmpty()) { // Not supported
-            config.aspectRatio.value = chooseAspectRatio()
-            return
-        }
-
-        val size: Size = sizes.chooseOptimalPreviewSize(preview.width, preview.height)
-
-        // Always re-apply camera parameters
         // Largest picture size in this ratio
-        val pictureSize: Size = pictureSizes.sizes(config.aspectRatio.value)
-            .takeIf { it.isNotEmpty() }
-            ?.last()
-            ?: size
+        val pictureSize: Size = pictureSizes.sizes(config.sensorAspectRatio)
+            .lastOrNull()
+            ?: previewSize
 
         if (showingPreview) stopPreview()
 
         updateCameraParams {
-            setPreviewSize(size.width, size.height)
+            setPreviewSize(previewSize.width, previewSize.height)
             setPictureSize(pictureSize.width, pictureSize.height)
             setRotation(calcCameraRotation(deviceRotation))
             jpegQuality = config.jpegQuality.value
